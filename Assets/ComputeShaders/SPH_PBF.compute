@@ -1,0 +1,417 @@
+#pragma kernel PredictPosition
+#pragma kernel ComputeLambda
+#pragma kernel ComputeDeltaPosition
+#pragma kernel ApplyDeltaPosition
+#pragma kernel FinalizeVelocityAndPosition
+#pragma kernel ApplyViscosity
+
+struct Particle
+{
+    float lambda;
+    float density;
+    float3 predictedPosition;
+    float3 velocity;
+    float3 position;
+    float _pad;
+};
+
+RWStructuredBuffer<Particle> _particles;
+RWStructuredBuffer<float3>   _deltaPositions;
+
+float particleMass = 2.0;
+float restDensity  = 300;
+float boundDamping = -0.5;
+float radius  = 2;
+float radius2 = 4;
+float radius3 = 8;
+float radius4 = 16;
+float pi      = 3.14159265358979;
+
+int   particleLength;
+float timestep = 1;
+
+float sCorrK;
+float sCorrN;
+float deltaQ;
+static const float lambdaEpsilon = 0.0001;
+
+float K;
+float n;
+float gammaDotMin;
+
+// bucketCenter = BOTTOM-CENTER of the bucket interior (floor centre, world space).
+// This is set correctly in C# as:
+//   GetContainerCenter() = EndPosition + RopeDirection * (handleHeight + bucketHeight)
+//
+// bucketUp = direction from FLOOR toward TOP OPENING (= -RopeDirection).
+// localY = dot(pos - bucketCenter, bucketUp)
+//   localY == 0          → at the floor
+//   localY == bucketHeight → at the top opening
+//   localY < 0           → below the floor (outside/escaped)
+//   localY > bucketHeight → above the top (escaped upward)
+float3 bucketCenter;
+float  bucketTopRadius;
+float  bucketBottomRadius;
+float  bucketHeight;
+float3 bucketUp;
+float3 bucketVelocity;
+float3 bucketAcceleration;
+
+float kAdhesion;
+float rInt;
+
+float3 spherePos;
+float  sphereRadius;
+
+// =============================================================================
+// SPH Kernels (Muller 2003)
+// =============================================================================
+
+float StdKernel(float distSq)
+{
+    float x = 1.0 - distSq / radius2;
+    return (315.0 / (64.0 * pi * radius3)) * x * x * x;
+}
+
+float SpikyFirstDeriv(float dist)
+{
+    float x = 1.0 - dist / radius;
+    return (-45.0 / (pi * radius4)) * x * x;
+}
+
+float3 SpikyGradient(float dist, float3 dir)
+{
+    return SpikyFirstDeriv(dist) * dir;
+}
+
+// =============================================================================
+// Bucket geometry
+// =============================================================================
+
+// Wall radius at height localY above the floor.
+float GetBucketRadius(float localY)
+{
+    float t = saturate(localY / max(bucketHeight, 1e-6));
+    return lerp(bucketBottomRadius, bucketTopRadius, t);
+}
+
+// Decomposes a world-space position into bucket-local components.
+// localY     : height above floor along bucketUp  (0=floor, bucketHeight=top)
+// horizontal : radial displacement from the center axis (perpendicular to bucketUp)
+void DecomposeToBucket(float3 pos, out float localY, out float3 horizontal)
+{
+    float3 local = pos - bucketCenter;
+    localY       = dot(local, bucketUp);
+    horizontal   = local - bucketUp * localY;
+}
+
+// =============================================================================
+// Adhesion force — pulls particles toward the nearest surface
+//
+// Wall: pull inward toward center axis  → direction = -normalize(horizontal)
+// Floor: pull toward floor             → direction = -bucketUp
+//        (bucketUp points floor→top, so -bucketUp points toward floor)
+// =============================================================================
+float3 ComputeAdhesionForce(float3 pos)
+{
+    float  localY;
+    float3 horizontal;
+    DecomposeToBucket(pos, localY, horizontal);
+    float rLen    = length(horizontal);
+    float bucketR = GetBucketRadius(localY);
+
+    // dSide   = distance from particle to side wall   (positive = inside)
+    float dSide   = bucketR - rLen;
+    // dBottom = distance from particle to floor        (positive = above floor)
+    float dBottom = localY;
+
+    float3 force = float3(0, 0, 0);
+
+    // Near the wall → pull toward axis
+    if (dSide < rInt && rLen > 1e-5)
+    {
+        float3 rDir = horizontal / rLen;             // outward unit vector from axis
+        force += kAdhesion * (rInt - dSide) * (-rDir); // inward pull
+    }
+
+    // Near the floor → pull toward floor
+    if (dBottom < rInt && dBottom >= 0)
+    {
+        force += kAdhesion * (rInt - dBottom) * (-bucketUp); // pull toward floor
+    }
+
+    return force;
+}
+
+// =============================================================================
+// ClampPositionToBucket
+//
+// Constrains a predicted position to remain inside the frustum bucket.
+// Uses fresh DecomposeToBucket calls so the floor branch never reads stale
+// `horizontal` from the wall branch.
+// =============================================================================
+void ClampPositionToBucket(inout float3 pos)
+{
+    // --- Wall constraint ---
+    float  localY;
+    float3 horizontal;
+    DecomposeToBucket(pos, localY, horizontal);
+    float rLen = length(horizontal);
+    float maxR = GetBucketRadius(localY) - radius;
+
+    if (rLen > maxR && maxR > 0)
+    {
+        float3 rDir = horizontal / max(rLen, 1e-5);
+        pos = bucketCenter + bucketUp * localY + rDir * maxR;
+    }
+
+    // --- Floor constraint (fresh decomposition after potential wall correction) ---
+    float  localY2;
+    float3 horizontal2;
+    DecomposeToBucket(pos, localY2, horizontal2);
+
+    if (localY2 < radius)
+    {
+        pos = bucketCenter + bucketUp * radius + horizontal2;
+    }
+
+    // --- Top-opening constraint (prevents upward escape) ---
+    float  localY3;
+    float3 horizontal3;
+    DecomposeToBucket(pos, localY3, horizontal3);
+
+    if (localY3 > bucketHeight - radius)
+    {
+        pos = bucketCenter + bucketUp * (bucketHeight - radius) + horizontal3;
+    }
+}
+
+// =============================================================================
+// ClampToBucket — position + velocity response
+// =============================================================================
+void ClampToBucket(inout float3 pos, inout float3 vel)
+{
+    // --- Wall ---
+    float  localY;
+    float3 horizontal;
+    DecomposeToBucket(pos, localY, horizontal);
+    float rLen = length(horizontal);
+    float maxR = GetBucketRadius(localY) - radius;
+
+    if (rLen > maxR && maxR > 0)
+    {
+        float3 rDir = horizontal / max(rLen, 1e-5);
+
+        float  velY       = dot(vel, bucketUp);
+        float3 velH       = vel - bucketUp * velY;
+        float  velRad     = dot(velH, rDir);
+        float  bvelY      = dot(bucketVelocity, bucketUp);
+        float3 bvelH      = bucketVelocity - bucketUp * bvelY;
+        float  bvelRad    = dot(bvelH, rDir);
+        float  relRad     = (velRad - bvelRad) * boundDamping;
+        velH = rDir * (relRad + bvelRad) + (velH - rDir * velRad);
+        vel  = bucketUp * velY + velH;
+        pos  = bucketCenter + bucketUp * localY + rDir * maxR;
+    }
+
+    // --- Floor (fresh decomposition) ---
+    float  localY2;
+    float3 horizontal2;
+    DecomposeToBucket(pos, localY2, horizontal2);
+
+    if (localY2 < radius)
+    {
+        pos = bucketCenter + bucketUp * radius + horizontal2;
+
+        float  velY    = dot(vel, bucketUp);
+        float  bvelY   = dot(bucketVelocity, bucketUp);
+        float  relY    = (velY - bvelY) * boundDamping;
+        float3 velH    = vel - bucketUp * velY;
+        vel = bucketUp * (relY + bvelY) + velH;
+    }
+
+    // --- Top opening (fresh decomposition) ---
+    float  localY3;
+    float3 horizontal3;
+    DecomposeToBucket(pos, localY3, horizontal3);
+
+    if (localY3 > bucketHeight - radius)
+    {
+        pos = bucketCenter + bucketUp * (bucketHeight - radius) + horizontal3;
+
+        float  velY    = dot(vel, bucketUp);
+        float  bvelY   = dot(bucketVelocity, bucketUp);
+        float  relY    = (velY - bvelY) * boundDamping;
+        float3 velH    = vel - bucketUp * velY;
+        vel = bucketUp * (relY + bvelY) + velH;
+    }
+}
+
+// =============================================================================
+// PredictPosition
+//
+// Force integration in the non-inertial frame of the swinging bucket.
+//
+// Physics:
+//   World gravity:          a = (0, -9.81, 0)   [applied once, world space]
+//   Non-inertial frame:     a_pseudo = -a_bucket [bucket accelerates, contents resist]
+//   Net:  vel += (gravity - bucketAcceleration) * dt
+// =============================================================================
+[numthreads(100, 1, 1)]
+void PredictPosition(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+
+    float3 pos = _particles[id.x].position;
+    float3 vel = _particles[id.x].velocity;
+
+    // Gravity (world space) — once.
+    vel += float3(0.0, -9.81, 0.0) * timestep;
+
+    // Non-inertial pseudo-force: F = -m*a_bucket → a_particle -= a_bucket
+    vel -= bucketAcceleration * timestep;
+
+    // Adhesion toward bucket surfaces.
+    vel += (ComputeAdhesionForce(pos) / particleMass) * timestep;
+
+    // Sphere obstacle.
+    float3 colDir = pos - spherePos;
+    float  colLen = length(colDir);
+    if (colLen < sphereRadius && colLen > 1e-5)
+    {
+        vel += (colDir * (300.0 * sphereRadius / (colLen * particleMass))) * timestep;
+    }
+
+    float3 predicted = pos + vel * timestep;
+    ClampPositionToBucket(predicted);
+
+    _particles[id.x].velocity          = vel;
+    _particles[id.x].predictedPosition = predicted;
+}
+
+
+[numthreads(100, 1, 1)]
+void ComputeLambda(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+    float3 origin = _particles[id.x].predictedPosition;
+
+    float  densitySum     = 0;
+    float3 selfGradSum    = float3(0, 0, 0);
+    float  sumGradSquared = 0;
+
+    for (int i = 0; i < particleLength; i++)
+    {
+        float3 diff   = origin - _particles[i].predictedPosition;
+        float  distSq = dot(diff, diff);
+
+        if (distSq < radius2)
+        {
+            densitySum += particleMass * StdKernel(distSq);
+
+            if ((uint)i != id.x && distSq > 1e-12)
+            {
+                float  dist  = sqrt(distSq);
+                float3 dir   = diff / dist;
+                float3 gradW = SpikyGradient(dist, dir);
+
+                sumGradSquared += dot(-(1.0 / restDensity) * gradW,
+                                      -(1.0 / restDensity) * gradW);
+                selfGradSum    += gradW;
+            }
+        }
+    }
+
+    float3 gradCi   = (1.0 / restDensity) * selfGradSum;
+    sumGradSquared += dot(gradCi, gradCi);
+
+    float Ci = (densitySum / restDensity) - 1.0;
+
+    _particles[id.x].density = densitySum;
+    _particles[id.x].lambda  = -Ci / (sumGradSquared + lambdaEpsilon);
+}
+
+
+[numthreads(100, 1, 1)]
+void ComputeDeltaPosition(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+    float3 origin    = _particles[id.x].predictedPosition;
+    float  lambda_i  = _particles[id.x].lambda;
+    float  wDeltaQ   = StdKernel(deltaQ * deltaQ);
+
+    float3 delta = float3(0, 0, 0);
+
+    for (int i = 0; i < particleLength; i++)
+    {
+        if ((uint)i == id.x) continue;
+
+        float3 diff   = origin - _particles[i].predictedPosition;
+        float  distSq = dot(diff, diff);
+
+        if (distSq < radius2 && distSq > 1e-12)
+        {
+            float  dist  = sqrt(distSq);
+            float3 dir   = diff / dist;
+            float  wPoly = StdKernel(distSq);
+            float  sCorr = -sCorrK * pow(abs(wPoly) / max(wDeltaQ, 1e-6), sCorrN);
+            delta += (lambda_i + _particles[i].lambda + sCorr) * SpikyGradient(dist, dir);
+        }
+    }
+
+    _deltaPositions[id.x] = delta / restDensity;
+}
+
+
+[numthreads(100, 1, 1)]
+void ApplyDeltaPosition(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+    float3 newPos = _particles[id.x].predictedPosition + _deltaPositions[id.x];
+    ClampPositionToBucket(newPos);
+    _particles[id.x].predictedPosition = newPos;
+}
+
+
+[numthreads(100, 1, 1)]
+void FinalizeVelocityAndPosition(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+    float3 oldPos = _particles[id.x].position;
+    float3 newPos = _particles[id.x].predictedPosition;
+
+    float3 vel = (newPos - oldPos) / max(timestep, 1e-6);
+    ClampToBucket(newPos, vel);
+
+    _particles[id.x].velocity = vel;
+    _particles[id.x].position = newPos;
+}
+
+
+[numthreads(100, 1, 1)]
+void ApplyViscosity(uint3 id : SV_DISPATCHTHREADID)
+{
+    if ((int)id.x >= particleLength) return;
+    float3 origin = _particles[id.x].position;
+    float3 velA   = _particles[id.x].velocity;
+
+    float3 S = float3(0, 0, 0);
+
+    for (int i = 0; i < particleLength; i++)
+    {
+        if ((uint)i == id.x) continue;
+
+        float3 diff   = origin - _particles[i].position;
+        float  distSq = dot(diff, diff);
+
+        if (distSq < radius2)
+        {
+            S += (_particles[i].velocity - velA) * StdKernel(distSq);
+        }
+    }
+
+    float gammaDot = length(S);
+    float mu       = K * pow(max(gammaDot, gammaDotMin), n - 1.0);
+
+    _particles[id.x].velocity = velA + timestep * mu * S;
+}

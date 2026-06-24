@@ -1,0 +1,205 @@
+#pragma kernel ComputeDensityPressure
+#pragma kernel ComputeForces
+#pragma kernel Integrate
+
+struct Particle
+{
+    float pressure;
+    float density;
+    float3 currentForce;
+    float3 velocity;
+    float3 position;
+};
+
+RWStructuredBuffer<Particle> _particles;
+float4x4 bucketWorldToLocal;
+float4x4 bucketLocalToWorld;
+float bucketHeight;
+float bucketTopRadius;
+float bucketBottomRadius;
+float3 bucketVelocity;
+float particleMass = 2.0;
+float viscosity = 200;
+float gasConstant = 2000;
+float restDensity = 300;
+float boundDamping = -0.5;
+float radius = 2;
+float radius3 = 8;
+float radius2 = 4;
+float radius4 = 16;
+float radius5 = 32;
+float pi = 3.1415926535897932384626433832795028841971;
+
+int particleLength;
+
+// Pre-computed
+float densityWeightConstant = 0.00497359197162172924277761760539;
+float spikyGradient = -0.09947183943243458485555235210782;
+float viscLaplacian = 0.39788735772973833942220940843129;
+
+float timestep = 1;
+
+float3 boxSize;
+
+float StdKernel(float distanceSquared)
+{
+    // Doyub Kim
+    float x = 1.0f - distanceSquared / radius2;
+    return 315.f / ( 64.f * pi * radius3 ) * x * x * x;
+}
+
+
+[numthreads(100,1,1)]
+void ComputeDensityPressure (uint3 id: SV_DISPATCHTHREADID)
+{
+    
+   float3 origin = _particles[id.x].position;
+   float sum = 0;
+   
+   for (int i = 0; i < particleLength; i++) {
+    
+        // if (origin.x == _particles[i].position.x && origin.y == _particles[i].position.y && origin.z == _particles[i].position.z) {
+        //     continue;
+        // }
+
+        float3 diff = origin - _particles[i].position;
+        float distanceSquared = dot(diff, diff);
+        
+        if (radius2*0.004 > distanceSquared*0.004) {
+            float x = (radius2*0.004) - (distanceSquared*0.004);
+            sum += StdKernel(distanceSquared*0.004);
+        } 
+   }
+   
+   _particles[id.x].density = sum * particleMass + 0.000001f;
+   _particles[id.x].pressure = gasConstant * (_particles[id.x].density - restDensity);
+
+   if (_particles[id.x].pressure <= 0) _particles[id.x].pressure = 0;
+}
+
+
+// Doyub Kim page 130
+float SpikyKernelFirstDerivative(float distance)
+{
+    float x = 1.0f - distance / radius;
+    return -45.0f / ( pi * radius4 ) * x * x;
+}
+
+// Doyub Kim page 130
+float SpikyKernelSecondDerivative(float distance)
+{
+    // Btw, it derives 'distance' not 'radius' (h)
+    float x = 1.0f - distance / radius;
+    return 90.f / ( pi * radius5 ) * x;
+}
+
+
+float3 SpikyKernelGradient(float distance, float3 directionFromCenter)
+{
+    return SpikyKernelFirstDerivative(distance) * directionFromCenter;
+}
+
+float3 spherePos;
+float sphereRadius;
+
+[numthreads(100,1,1)]
+void ComputeForces (uint3 id: SV_DISPATCHTHREADID)
+{
+    float3 origin = _particles[id.x].position;
+    float density2 = _particles[id.x].density * _particles[id.x].density; 
+    float3 pressure = float3(0,0,0);
+    float3 visc = float3(0,0,0);
+    float mass2 = particleMass * particleMass;
+
+    for (int i = 0; i < particleLength; i++) {
+        
+        if (origin.x == _particles[i].position.x && origin.y == _particles[i].position.y && origin.z == _particles[i].position.z) {
+            continue;
+        }
+
+        float dist = distance(_particles[i].position, origin);
+        if (dist < radius*2) {
+            float3 pressureGradientDirection = normalize(_particles[id.x].position-_particles[i].position);
+            pressure += mass2 * ( _particles[id.x].pressure / density2 + _particles[i].pressure / ( _particles[i].density * _particles[i].density ) ) * SpikyKernelGradient(dist, pressureGradientDirection);   // Kim
+            visc += viscosity * mass2 * ( _particles[i].velocity - _particles[id.x].velocity ) / _particles[i].density * SpikyKernelSecondDerivative(dist);
+        }
+    }
+
+    _particles[id.x].currentForce = float3(0,(-9.81 * particleMass), 0) - pressure + visc;
+
+    // Handle Collision
+
+    float3 colDir = _particles[id.x].position-spherePos;
+    if (length(colDir) < sphereRadius) {
+        float mag = sphereRadius/length(colDir);
+        _particles[id.x].currentForce += colDir*300*mag;
+    }
+
+    // + pressure + visc/_particles[id.x].density;
+}
+
+[numthreads(100,1,1)]
+void Integrate (uint3 id: SV_DISPATCHTHREADID)
+{
+    // 1. Calculate velocity and new positions like your current code
+    float3 vel = _particles[id.x].velocity + ((_particles[id.x].currentForce / particleMass) * timestep);
+    float3 nextPosition = _particles[id.x].position + (vel * timestep);
+
+    // 2. Transform the particle position into the Bucket's Local Coordinate Space
+    // In local space, the bucket is fixed, upright, and centered at (0,0,0)
+    float3 localPos = mul(bucketWorldToLocal, float4(nextPosition, 1.0)).xyz;
+    
+    // Calculate velocity relative to the bucket's movement
+    float3 localVel = mul((float3x3)bucketWorldToLocal, vel - bucketVelocity);
+
+    float halfHeight = bucketHeight * 0.5;
+
+    // --- CONSTRAINT A: Bottom of the Bucket ---
+    if (localPos.y - radius < -halfHeight) 
+    {
+        localPos.y = -halfHeight + radius;
+        localVel.y *= boundDamping; 
+    }
+    // Top boundary constraint (keeps paint from flying out the top opening during massive swings)
+    if (localPos.y + radius > halfHeight)
+    {
+        localPos.y = halfHeight - radius;
+        localVel.y *= boundDamping;
+    }
+
+    // --- CONSTRAINT B: Slanted Side Walls (Conical Frustum Math) ---
+    // Calculate how high up the bucket the particle is sitting (0.0 at bottom, 1.0 at top)
+    float hPct = clamp((localPos.y + halfHeight) / bucketHeight, 0.0, 1.0);
+    
+    // Linearly interpolate the exact radius of the bucket wall at this specific height
+    float currentWallRadius = lerp(bucketBottomRadius, bucketTopRadius, hPct);
+    
+    // Find horizontal distance from the center axis of the bucket
+    float distFromCenter = length(localPos.xz);
+
+    // Check if particle is penetrating or passing through the wall boundary
+    if (distFromCenter > (currentWallRadius - radius)) 
+    {
+        // Determine the horizontal direction vector pointing out towards the wall
+        float2 dirXZ = normalize(localPos.xz);
+        
+        // Push the particle back inside the safety threshold of the inner wall
+        localPos.xz = dirXZ * (currentWallRadius - radius);
+
+        // Calculate the mathematical surface normal pointing INWARD
+        float wallSlope = (bucketTopRadius - bucketBottomRadius) / bucketHeight;
+        float3 inwardNormal = normalize(float3(-dirXZ.x, wallSlope, -dirXZ.y));
+
+        // Reflect relative velocity across the wall normal vector
+        float velAlongNormal = dot(localVel, inwardNormal);
+        if (velAlongNormal < 0.0) 
+        {
+            localVel = localVel - 2.0 * velAlongNormal * inwardNormal;
+            localVel *= abs(boundDamping); // Apply friction/energy loss
+        }
+    }
+
+    // 3. Transform coordinates back into World Space for engine rendering
+    _particles[id.x].position = mul(bucketLocalToWorld, float4(localPos, 1.0)).xyz;
+    _particles[id.x].velocity = mul((float3x3)bucketLocalToWorld, localVel) + bucketVelocity;
+}
