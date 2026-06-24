@@ -181,6 +181,12 @@ public class SPH_Compute : MonoBehaviour
 
     private void InitializeComputeBuffers()
     {
+        if (totalSpawned <= 0)
+        {
+            UnityEngine.Debug.LogError("[SPH_Compute] Cannot initialize buffers with 0 particles. SpawnParticlesInBox failed.");
+            return;
+        }
+
         int stride = System.Runtime.InteropServices.Marshal.SizeOf(typeof(Particle));
         _particlesBuffer = new ComputeBuffer(totalSpawned, stride);
         _particlesBuffer.SetData(particles);
@@ -218,16 +224,17 @@ public class SPH_Compute : MonoBehaviour
         shader.SetFloat("gammaDotMin", gammaDotMin);
 
         int[] kernels = {
-        predictPositionKernel, computeLambdaKernel,
-        computeDeltaPositionKernel, applyDeltaPositionKernel,
-        finalizeKernel, applyViscosityKernel
-    };
+            predictPositionKernel, computeLambdaKernel,
+            computeDeltaPositionKernel, applyDeltaPositionKernel,
+            finalizeKernel, applyViscosityKernel
+        };
         foreach (int k in kernels)
             shader.SetBuffer(k, "_particles", _particlesBuffer);
 
         shader.SetBuffer(computeDeltaPositionKernel, "_deltaPositions", _deltaPositionsBuffer);
         shader.SetBuffer(applyDeltaPositionKernel, "_deltaPositions", _deltaPositionsBuffer);
     }
+
     private void SpawnParticlesInBox(Vector3 center)
     {
         List<Particle> spawnedParticles = new List<Particle>();
@@ -235,9 +242,11 @@ public class SPH_Compute : MonoBehaviour
         // Get bucket orientation at spawn time.
         // If no container is connected yet, fall back to world-up.
         Vector3 bucketUp = container != null ? container.GetContainerUp() : Vector3.up;
-        float topR = container != null ? container.GetTopRadius() : 0.48f;
-        float botR = container != null ? container.GetBottomRadius() : 0.33f;
-        float height = container != null ? container.GetHeight() : 1.05f;
+        
+        // Ensure we have non-zero dimensions for the grid sweep
+        float topR = container != null ? Mathf.Max(container.GetTopRadius(), 0.1f) : 0.48f;
+        float botR = container != null ? Mathf.Max(container.GetBottomRadius(), 0.1f) : 0.33f;
+        float height = container != null ? Mathf.Max(container.GetHeight(), 0.1f) : 1.05f;
 
         // Build two axes perpendicular to bucketUp for the horizontal grid sweep.
         Vector3 right = Vector3.Cross(bucketUp, Vector3.forward);
@@ -249,31 +258,34 @@ public class SPH_Compute : MonoBehaviour
         float yStart = particleRadius * 2f;     // start one diameter above floor
         float yEnd = height * 0.7f;           // fill to 70 % height (leaves headroom)
 
-        for (float ly = yStart; ly < yEnd; ly += spacing)
+        if (spacing > 0 && yEnd > yStart)
         {
-            // Wall radius at this height, shrunk inward so no particle touches the wall on spawn
-            float t = ly / height;
-            float wallR = Mathf.Lerp(botR, topR, t);
-            float safeR = wallR - particleRadius * 3f;    // 3-radius safety margin from wall
-            if (safeR <= 0f) continue;
-
-            for (float lx = -safeR; lx <= safeR; lx += spacing)
+            for (float ly = yStart; ly < yEnd; ly += spacing)
             {
-                for (float lz = -safeR; lz <= safeR; lz += spacing)
+                // Wall radius at this height, shrunk inward so no particle touches the wall on spawn
+                float t = ly / height;
+                float wallR = Mathf.Lerp(botR, topR, t);
+                float safeR = wallR - particleRadius * 3f;    // 3-radius safety margin from wall
+                if (safeR <= 0f) continue;
+
+                for (float lx = -safeR; lx <= safeR; lx += spacing)
                 {
-                    // Only spawn if inside the safe cylinder at this height
-                    if (Mathf.Sqrt(lx * lx + lz * lz) > safeR) continue;
+                    for (float lz = -safeR; lz <= safeR; lz += spacing)
+                    {
+                        // Only spawn if inside the safe cylinder at this height
+                        if (Mathf.Sqrt(lx * lx + lz * lz) > safeR) continue;
 
-                    // World-space position: center + ly along bucketUp + lx/lz in the horizontal plane
-                    Vector3 worldPos = center
-                        + bucketUp * ly
-                        + right * lx
-                        + forward * lz;
+                        // World-space position: center + ly along bucketUp + lx/lz in the horizontal plane
+                        Vector3 worldPos = center
+                            + bucketUp * ly
+                            + right * lx
+                            + forward * lz;
 
-                    // Tiny random jitter (< 5 % of spacing) to break grid symmetry
-                    worldPos += UnityEngine.Random.insideUnitSphere * (spacing * 0.04f);
+                        // Tiny random jitter (< 5 % of spacing) to break grid symmetry
+                        worldPos += UnityEngine.Random.insideUnitSphere * (spacing * 0.04f);
 
-                    spawnedParticles.Add(new Particle { position = worldPos });
+                        spawnedParticles.Add(new Particle { position = worldPos });
+                    }
                 }
             }
         }
@@ -282,7 +294,7 @@ public class SPH_Compute : MonoBehaviour
 
         if (totalSpawned == 0)
         {
-            UnityEngine.Debug.LogWarning("[SPH_Compute] Bucket-aware spawn produced 0 particles. Falling back to single particle at center.");
+            UnityEngine.Debug.LogWarning("[SPH_Compute] Bucket-aware spawn produced 0 particles (dimensions may be uninitialized). Falling back to single particle at center.");
             spawnedParticles.Add(new Particle { position = center });
             totalSpawned = 1;
         }
@@ -293,9 +305,10 @@ public class SPH_Compute : MonoBehaviour
         UnityEngine.Debug.Log($"[SPH_Compute] Spawned {totalSpawned} particles inside bucket " +
                   $"(r={botR:F2}-{topR:F2}m, h={height:F2}m, spacing={spacing:F3}m)");
     }
+
     private void FixedUpdate()
     {
-        if (!initialized) return;
+        if (!initialized || _particlesBuffer == null) return;
 
         shader.SetFloat("timestep", timestep);
 
@@ -337,6 +350,7 @@ public class SPH_Compute : MonoBehaviour
 
         shader.SetInt("particleLength", ActiveParticleCount);
         int threadGroups = Mathf.CeilToInt(ActiveParticleCount / 100.0f);
+        if (threadGroups <= 0) threadGroups = 1;
 
         shader.Dispatch(predictPositionKernel, threadGroups, 1, 1);
 
@@ -396,70 +410,27 @@ public class SPH_Compute : MonoBehaviour
             material,
             renderBounds,
             _argsBuffer,
-            castShadows: UnityEngine.Rendering.ShadowCastingMode.Off,
-            receiveShadows: false,
-            layer: gameObject.layer);
+            0,
+            null,
+            UnityEngine.Rendering.ShadowCastingMode.Off,
+            false
+        );
     }
 
     private Bounds GetRenderBounds()
     {
         if (container != null)
         {
-            Vector3 center = container.GetContainerCenter() + container.GetContainerUp() * container.GetHeight() * 0.5f;
-            float maxDiameter = Mathf.Max(container.GetTopRadius(), container.GetBottomRadius()) * 2f;
-            float size = Mathf.Max(maxDiameter, container.GetHeight()) + particleRenderSize * 4f;
-            return new Bounds(center, Vector3.one * Mathf.Max(size, 2f));
+            float r = Mathf.Max(container.GetTopRadius(), container.GetBottomRadius());
+            return new Bounds(container.GetContainerCenter(), new Vector3(r * 3, container.GetHeight() * 3, r * 3));
         }
-
-        Vector3 fallbackSize = spawnBox + Vector3.one * Mathf.Max(particleRenderSize * 4f, 1f);
-        return new Bounds(spawnBoxCenter, fallbackSize);
+        return new Bounds(Vector3.zero, Vector3.one * 1000f);
     }
 
     private void OnDestroy()
     {
-        _particlesBuffer?.Release();
-        _argsBuffer?.Release();
-        _deltaPositionsBuffer?.Release();
-    }
-
-    private void OnDrawGizmos()
-    {
-        if (!Application.isPlaying)
-        {
-            Gizmos.color = Color.cyan;
-            Gizmos.DrawWireCube(spawnBoxCenter, spawnBox);
-        }
-
-        if (container != null)
-        {
-            Gizmos.color = Color.blue;
-            Vector3 center = container.GetContainerCenter();
-            Vector3 up = container.GetContainerUp();
-            DrawWireFrustumGizmo(center, up, container.GetBottomRadius(), container.GetTopRadius(), container.GetHeight());
-        }
-    }
-
-    private void DrawWireFrustumGizmo(Vector3 baseCenter, Vector3 axis, float bottomRadius, float topRadius, float height, int segments = 24)
-    {
-        Quaternion rot = Quaternion.FromToRotation(Vector3.up, axis);
-        Vector3 topCenter = baseCenter + axis * height;
-        Vector3 prevBase = baseCenter + rot * new Vector3(bottomRadius, 0, 0);
-        Vector3 prevTop = topCenter + rot * new Vector3(topRadius, 0, 0);
-
-        for (int i = 1; i <= segments; i++)
-        {
-            float angle = (i / (float)segments) * Mathf.PI * 2f;
-            Vector3 baseOffset = rot * new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle)) * bottomRadius;
-            Vector3 topOffset = rot * new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle)) * topRadius;
-            Vector3 curBase = baseCenter + baseOffset;
-            Vector3 curTop = topCenter + topOffset;
-
-            Gizmos.DrawLine(prevBase, curBase);
-            Gizmos.DrawLine(prevTop, curTop);
-            if (i % 4 == 0) Gizmos.DrawLine(curBase, curTop);
-
-            prevBase = curBase;
-            prevTop = curTop;
-        }
+        if (_particlesBuffer != null) _particlesBuffer.Release();
+        if (_argsBuffer != null) _argsBuffer.Release();
+        if (_deltaPositionsBuffer != null) _deltaPositionsBuffer.Release();
     }
 }

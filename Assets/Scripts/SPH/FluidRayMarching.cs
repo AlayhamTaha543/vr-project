@@ -37,6 +37,8 @@ public class FluidRayMarching : MonoBehaviour
 
     public void Begin()
     {
+        if (sph == null || sph._particlesBuffer == null) return;
+
         InitRenderTexture();
         raymarching.SetBuffer(0, "particles", sph._particlesBuffer);
         raymarching.SetInt("numParticles", sph.ActiveParticleCount);
@@ -51,9 +53,16 @@ public class FluidRayMarching : MonoBehaviour
     void OnRenderImage(RenderTexture source, RenderTexture destination)
     {
         if (!render)
+        {
             Begin();
+            if (!render)
+            {
+                Graphics.Blit(source, destination);
+                return;
+            }
+        }
 
-        if (render)
+        if (render && sph._particlesBuffer != null)
         {
             raymarching.SetVector("_Light", lightSource.transform.forward);
             raymarching.SetFloat("_NearClip", cam.nearClipPlane);
